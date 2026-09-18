@@ -33,7 +33,7 @@ module multiplier_tb();
 
         .DATA_WIDTH_FAC1(DATA_WIDTH_FAC1),
         .DATA_WIDTH_FAC2(DATA_WIDTH_FAC2),
-        .DATA_WIDTH_PROD(DATA_WIDTH_PROD),
+        .DATA_WIDTH_PROD(DATA_WIDTH_PROD)
         //.Q_BITWIDTH(Q_BITWIDTH)
 
     ) multiplier(
@@ -43,8 +43,9 @@ module multiplier_tb();
         .multiplier_en_i(multiplier_en_i_tb),
         .factor_1(factor1_tb),
         .factor_2(factor2_tb),
-        .product(product_tb),
-        //.fraction_bit_i(fraction_bit_i));
+        .product(product_tb)
+        //.fraction_bit_i(fraction_bit_i)
+    );
 
  
     // main test block
