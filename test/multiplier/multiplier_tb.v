@@ -10,7 +10,7 @@ module multiplier_tb();
     localparam integer DATA_WIDTH_FAC1 = 8;
     localparam integer DATA_WIDTH_FAC2 = 8;
     localparam integer DATA_WIDTH_PROD = 20;
-    localparam integer Q_BITWIDTH      = $clog2(DATA_WIDTH_PROD);
+    //localparam integer Q_BITWIDTH      = $clog2(DATA_WIDTH_PROD);
 
     localparam integer TEST_STEP = 20;                         //only for testbench verification
 
@@ -21,7 +21,7 @@ module multiplier_tb();
     reg signed  [DATA_WIDTH_FAC1-1:0]   factor1_tb;
     reg signed  [DATA_WIDTH_FAC2-1:0]   factor2_tb;
     wire signed [DATA_WIDTH_PROD-1:0]   product_tb;
-    reg         [Q_BITWIDTH-1:0]        fraction_bit_i;
+    //reg         [Q_BITWIDTH-1:0]        fraction_bit_i;
 
     reg                                 result_in_step[0:TEST_STEP-1];      //Result vector //only for testbench verification
     reg                                 computation_was_right = 1;          //Result flag //only for testbench verification
