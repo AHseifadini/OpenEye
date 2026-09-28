@@ -99,14 +99,11 @@
 
 module GLB_cluster #(
     parameter         SERIAL             = 1'd0,
-    parameter integer PARALLEL_MACS      = 2,
     parameter integer DATA_IACT_BITWIDTH = 8,
     parameter integer DATA_WGHT_BITWIDTH = 8,
     parameter integer DATA_PSUM_BITWIDTH = 20,
 
     parameter integer TRANS_BITWIDTH_IACT = 24,
-    parameter integer TRANS_BITWIDTH_WGHT = 24,
-    parameter integer TRANS_BITWIDTH_PSUM = SERIAL ? DATA_PSUM_BITWIDTH : DATA_PSUM_BITWIDTH * PARALLEL_MACS,
 
     parameter integer NUM_GLB_IACT = 3,
     parameter integer NUM_GLB_WGHT = 3,
@@ -203,14 +200,14 @@ module GLB_cluster #(
         glb_counter = glb_counter + 1
     ) begin : gen_psum
 
-      wire [TRANS_BITWIDTH_PSUM-1:0] psum_glb_data_in_w;
-      wire [TRANS_BITWIDTH_PSUM-1:0] psum_glb_data_out_w;
+      wire [DATA_PSUM_BITWIDTH-1:0] psum_glb_data_in_w;
+      wire [DATA_PSUM_BITWIDTH-1:0] psum_glb_data_out_w;
       wire [ PSUM_MEM_ADDR_BITS-1:0] psum_glb_addr_in_w;
       wire                           psum_glb_re_in_w;
       wire                           psum_glb_we_in_w;
 
       RAM_SP #(
-          .DataWidth(TRANS_BITWIDTH_PSUM),
+          .DataWidth(DATA_PSUM_BITWIDTH),
           .AddrWidth(PSUM_MEM_ADDR_BITS),
           .Pipelined(1)
       ) psum_glb (
@@ -263,6 +260,7 @@ module GLB_cluster #(
     ) begin
       assign gen_psum[glb_counter].psum_glb_re_in_w = (ext_mem_psum_enable_i[glb_counter] & !data_write_enable_i);
       assign gen_psum[glb_counter].psum_glb_we_in_w = (ext_mem_psum_enable_i[glb_counter] & data_write_enable_i) | (router_cluster_psum_enable_i[glb_counter] & (!data_write_enable_i));
+      assign router_cluster_psum_enable_o[glb_counter] = router_cluster_psum_enable_o_delay_2[glb_counter];
       assign router_cluster_psum_enable_o_delay_1[glb_counter] = ext_mem_psum_enable_i[glb_counter] & (!data_write_enable_i);
       for (bit_counter = 0; bit_counter < PSUM_MEM_ADDR_BITS; bit_counter = bit_counter + 1) begin
         assign gen_psum[glb_counter].psum_glb_addr_in_w[bit_counter] = ext_mem_psum_addr_i[PSUM_MEM_ADDR_BITS*glb_counter+bit_counter];

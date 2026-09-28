@@ -205,6 +205,10 @@ async def single_layer_test(dut):
         model = SimpleMNISTConvNet()
         model = o2m.get_model(model)
         trunc_model = truncate_model(model)
+    if os.environ.get("OPENEYE_EXPECT_LAYERS"):
+        expected_layers = int(os.environ["OPENEYE_EXPECT_LAYERS"])
+        assert len(trunc_model) == expected_layers, (
+            f"{layer_mode}: expected {expected_layers} layers, got {len(trunc_model)}")
     await execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, serial, ptp, trunc_model)
 
 def truncate_model(model):
@@ -235,9 +239,33 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
         cocotb.start_soon(rtl_test_utils.monitor_iact_handoff(ptp, dut))
     if os.environ.get("DUMP_PSUM_BUFFERS") and not os.environ.get("OPENEYE_PROBE_FSM"):
         cocotb.start_soon(rtl_test_utils.monitor_iact_handoff(ptp, dut))
+    if os.environ.get("TRACE_CONVERTER_GATE"):
+        # Both cluster rows, to compare their acceptance windows directly.
+        cocotb.start_soon(rtl_test_utils.trace_converter_gate(ptp, dut, openeye_parameter, col=0, row=0))
+        cocotb.start_soon(rtl_test_utils.trace_converter_gate(ptp, dut, openeye_parameter, col=0, row=1))
+    if os.environ.get("DUMP_IACT_BUFFER"):
+        async def _dump_buf():
+            from cocotb.triggers import Timer as _T
+            for _ in range(400):
+                await _T(ptp.clk_cycle, unit=ptp.clk_cycle_unit)
+            rtl_test_utils.dump_iact_buffer_values(dut, openeye_parameter)
+        cocotb.start_soon(_dump_buf())
+    if os.environ.get("TRACE_CONVERT_WINDOW"):
+        cocotb.start_soon(rtl_test_utils.trace_convert_window(ptp, dut, openeye_parameter))
+    if os.environ.get("DUMP_CONVERT_LIMITS"):
+        cocotb.start_soon(rtl_test_utils.dump_convert_iact_limits(ptp, dut, openeye_parameter))
+    if os.environ.get("TRACE_IACT_LANES"):
+        cocotb.start_soon(rtl_test_utils.trace_iact_lanes(ptp, dut, openeye_parameter))
+    if os.environ.get("TRACE_PSUM_SLICES"):
+        cocotb.start_soon(rtl_test_utils.trace_psum_capture_slices(ptp, dut, openeye_parameter))
+    if os.environ.get("TRACE_CONV_WRITEBACK"):
+        cocotb.start_soon(rtl_test_utils.trace_conv_writeback(ptp, dut))
+    if os.environ.get("TRACE_PE_CALC"):
+        cocotb.start_soon(rtl_test_utils.trace_pe_calc_loop(ptp, dut, openeye_parameter))
     if os.environ.get("DUMP_CLUSTER_IACT"):
         cocotb.start_soon(rtl_test_utils.monitor_cluster_iact(ptp, dut, openeye_parameter))
         cocotb.start_soon(rtl_test_utils.monitor_pe_iact(ptp, dut, openeye_parameter))
+        cocotb.start_soon(rtl_test_utils.monitor_converter_store(ptp, dut, openeye_parameter))
     if os.environ.get("PROBE_PSUM_STREAM"):
         cocotb.start_soon(rtl_test_utils.probe_psum_stream(ptp, dut, openeye_parameter))
     if os.environ.get("TRACE_PSUM_CAPTURE"):
@@ -245,6 +273,16 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
         cocotb.start_soon(rtl_test_utils.trace_bias_load(ptp, dut, openeye_parameter))
     if os.environ.get("TRACE_CONVERTER"):
         cocotb.start_soon(rtl_test_utils.trace_converter(ptp, dut, openeye_parameter))
+    if os.environ.get("TRACE_RAM_WRITES"):
+        cocotb.start_soon(rtl_test_utils.trace_ram_writes(ptp, dut))
+    if os.environ.get("TRACE_POOLING"):
+        cocotb.start_soon(rtl_test_utils.trace_pooling(ptp, dut, max_lines=4000))
+    if os.environ.get("TRACE_PE_PASSES"):
+        cocotb.start_soon(rtl_test_utils.trace_pe_pass_counts(ptp, dut, openeye_parameter))
+    if os.environ.get("TRACE_WB_EVENTS"):
+        cocotb.start_soon(rtl_test_utils.trace_wb_events(ptp, dut))
+    if os.environ.get("TRACE_ALL_PE"):
+        cocotb.start_soon(rtl_test_utils.trace_all_pe_states(ptp, dut, openeye_parameter, max_lines=4000))
     if os.environ.get("TRACE_PE_IACT"):
         cocotb.start_soon(rtl_test_utils.trace_pe_iact(ptp, dut, openeye_parameter))
     if os.environ.get("TRACE_PE_PSUM"):
@@ -256,6 +294,20 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
     for layer_number, layer in reversed(list(enumerate(model))):
         layer_parameters[max_layers - layer_number - 1] = lp.LayerParameters(layer_parameters, layer, openeye_parameter, layer_number, max_layers)
     layer_parameters = list(reversed(layer_parameters))
+    if os.environ.get("DUMP_LAYER_PARAMS"):
+        for n, lpar in enumerate(layer_parameters):
+            fields = sorted(k for k in vars(lpar) if k.startswith(("iact_read_", "iact_write_", "psum_pagu_"))
+                            or k in ("iact_x_lines", "iact_x_line_repetitions", "iact_words_per_compute",
+                                     "needed_iact_buffer_words", "needed_Iact_writes", "channel_div_trans",
+                                     "used_channels", "diff_iact_layer", "needed_wght_cycles",
+                                     "iact_repetitions_per_write", "iact_converter_max_cycles",
+                                     "buffer_cycles_for_x_iact", "iact_converter_buffer_addr_max_cycles",
+                                     "lower_bound", "upper_bound", "used_Y_cluster", "y_lines_per_calculation",
+                                     "different_kernels_per_calculation", "padding_y", "padding_x", "strideY",
+                                     "used_X_cluster", "iact_x_add_up", "psum_size_y", "psum_size_x", "filters",
+                                     "fsm_psum_limit", "used_psum_per_PE", "iact_size_x", "iact_size_y",
+                                     "diff_iact_layer_next_layer", "psum_storage_cycles"))
+            logger.info("layerparams %d: %s", n, " ".join("%s=%s" % (k, getattr(lpar, k)) for k in fields))
     for n, lpar in enumerate(layer_parameters):
         logger.info("layer %d/%d %s: in=%sx%s ch=%s filters=%s send_values_out=%s "
                     "store_in_psum=%s transmissions=%s output_cycles=%s psum_output_words=%s "
@@ -301,6 +353,47 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
             return [_const_w(v) for v in x] if isinstance(x, list) else const_wght
         dram.weights = _const_w(dram.weights)
         logger.info("OPENEYE_CONST_WGHTS: all weights set to %d", const_wght)
+    if os.environ.get("OPENEYE_ASYMMETRIC_KERNEL"):
+        # Distinct kernel rows/columns expose permutations that constant
+        # weights hide. Both the mapper and reference read this same DRAM.
+        for layer_number, params in enumerate(layer_parameters):
+            if "Conv" not in str(params.layer_name):
+                continue
+            for channel in dram.weights[layer_number]:
+                for kernel in channel:
+                    for y, row in enumerate(kernel):
+                        for x in range(len(row)):
+                            row[x] = 1 + x + len(row) * y
+        logger.info("OPENEYE_ASYMMETRIC_KERNEL: weight[y][x] = 1 + x + kernel_width*y")
+    if os.environ.get("OPENEYE_RAMP_IACTS"):
+        # Layer-0 activation k becomes k+1, so a PE's stored payloads name the
+        # exact input positions it received. Constant operands can only show
+        # how many activations arrived, never which ones.
+        def _ramp(x, ctr=[0]):
+            if isinstance(x, list):
+                return [_ramp(v, ctr) for v in x]
+            ctr[0] += 1
+            # Wrap so large inputs stay inside int8; small inputs are unchanged.
+            return (ctr[0] - 1) % 100 + 1
+        dram.fmap[0] = _ramp(dram.fmap[0])
+        logger.info("OPENEYE_RAMP_IACTS: layer-0 input set to 1..N in flat order")
+    if os.environ.get("OPENEYE_BIAS_STEP"):
+        # Give each output channel a distinct value after quantization so a
+        # channel permutation cannot pass a constant-weight regression.
+        step = int(os.environ["OPENEYE_BIAS_STEP"])
+        dram.bias = [[1 + step*f for f in range(len(bias))] for bias in dram.bias]
+        logger.info("OPENEYE_BIAS_STEP: bias[f] = 1 + %d*f", step)
+    if os.environ.get("DUMP_INPUT_IACTS"):
+        # Print the first activations of layer 0 so the values a PE holds can
+        # be matched against the input vector. Every PE holding the same window
+        # means the converter broadcasts instead of partitioning K.
+        try:
+            flat = dram.fmap[0]
+            while isinstance(flat, list) and flat and isinstance(flat[0], list):
+                flat = [v for sub in flat for v in sub]
+            logger.info("layer-0 input activations (first 34): %s", flat[:34])
+        except Exception as exc:
+            logger.info("could not flatten layer-0 input (%s)", type(exc).__name__)
     test_amount = 1
     for _ in range(test_amount) :
         for layer_number, layer in enumerate(model):
@@ -326,10 +419,18 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
                     gtu.create_stream_file(stream[layer_repetition],layer_number,layer_repetition)
                     if (only_files == 0) :
                         logger.info("Send stream No. " + str(layer_number+1))
+                        fc_write_check = None
+                        if (os.environ.get("OPENEYE_CHECK_FC_WRITES") and
+                                "Dense" in str(layer_parameters[layer_number].layer_name)):
+                            fc_write_check = cocotb.start_soon(rtl_test_utils.check_fc_activation_writes(
+                                dut, openeye_parameter, layer_parameters[layer_number], dram.fmap[layer_number]))
                         await cocotb.start_soon(rtl_test_utils.send_stream(ptp, dut, stream[layer_repetition], openeye_parameter, layer_parameters[layer_number], layer_repetition))
                         logger.info("Stream is sent.")
                         if (layer_number == max_layers - 1) :
                             await cocotb.start_soon(rtl_test_utils.await_enable_signal(ptp, dut))
+                            if fc_write_check is not None:
+                                assert fc_write_check.done(), "FC activation RAM writes incomplete"
+                                await fc_write_check
                             if("Depthwise" in str(layer_parameters[layer_number].layer_name)):
                                 await cocotb.start_soon(rtl_test_utils.compare_stream_Dw(ptp, dut, layer_number, layer_repetition, layer_parameters[layer_number], openeye_parameter, layer_es, dram, log_level))
                             elif("Conv" in str(layer_parameters[layer_number].layer_name)):
@@ -344,16 +445,10 @@ async def execute_model(dut, only_files, sparse_iacts, sparse_wghts, layer_es, s
                                 for f in range(len(calculated_results)):
                                     logger.info("dense f=%2d ref=%s dut=%s", f, calculated_results[f],
                                                 dram.fmap[1 + layer_number][f])
-                            # The Dense dma_stream_ref.txt layout does not match the FC
-                            # read-out (one psum per DMA word, columns interleaved), so
-                            # the line compare can only fail. compare_dram_with_ref below
-                            # checks every Dense output exactly, per filter.
-                            # Run both checks before asserting: the value-level compare
-                            # reports how many outputs differ, which the line compare of
-                            # the reference file cannot, and an early assert hid it.
+                            # Check both decoded values and the complete DMA stream.
                             dram_ok = tum.compare_dram_with_ref(layer_parameters[layer_number], calculated_results, dram.fmap[1 + layer_number])
                             file_ok = True
-                            if(logging.DEBUG >= log_level) and ("Dense" not in str(layer_parameters[layer_number].layer_name)):
+                            if(logging.DEBUG >= log_level):
                                 file_ok = gtu.check_results(openeye_parameter, 'demo/layer_' + str(layer_number) + '_' + str(layer_repetition) + '/dma_stream_ref.txt',\
                                                             'demo/layer_' + str(layer_number) + '_' + str(layer_repetition) + '/output.txt')
                             assert dram_ok and file_ok, "result check failed: values %s, reference file %s" % (

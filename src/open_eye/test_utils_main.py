@@ -288,23 +288,23 @@ def make_ref(params, layer_params, layer_number, dram, calculated_results):
         for layer_repetition in range(layer_params.needed_total_transmissions):
             output_order.append(return_dict[layer_repetition])
     elif "Dense" in str(layer_params.layer_name):
-        words_per_transmission = params.DMA_BITWIDTH//params.DATA_PSUM_BITWIDTH
-        layer_repetition = 0
-        file_dma_ref = gtu.open_or_create_file('demo/layer_' + str(layer_number) + '_' + str(layer_repetition) + '/dma_stream_ref.txt')
-        if(params.SERIAL):
-            for refresh in range(math.ceil(len(calculated_results))):
-                for x in range(words_per_transmission) :
-                    partial_result_a = gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH)
-                    partial_result_b = gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH)
-                    try:
-                        partial_result_b = gtu.to_twos_complement_string(calculated_results[refresh + x * layer_params.used_psum_per_PE],params.DATA_PSUM_BITWIDTH)
-                    except:
-                        partial_result_b = partial_result_b
-                    if (params.Clusters_X == 1):
-                        file_dma_ref.write(partial_result_b + "\n")
-                    else:
-                        file_dma_ref.write(partial_result_a + partial_result_b + "\n")
-            file_dma_ref.close()
+        if params.SERIAL:
+            # FC emits one accumulator per DMA beat, interleaving columns
+            # at each buffer address. Cluster rows contribute to the same sum.
+            per_column = math.ceil(layer_params.used_psum_per_PE)
+            mask = (1 << params.DATA_PSUM_BITWIDTH) - 1
+            for repetition in range(layer_params.needed_total_transmissions):
+                tile = ((repetition // layer_params.iact_transmissions_pe)
+                        % layer_params.psum_transmissions_pe)
+                offset = tile * params.Clusters_X * per_column
+                path = f'demo/layer_{layer_number}_{repetition}/dma_stream_ref.txt'
+                with gtu.open_or_create_file(path) as file_dma_ref:
+                    for address in range(per_column):
+                        for column in range(params.Clusters_X):
+                            index = offset + column * per_column + address
+                            value = calculated_results[index] if index < len(calculated_results) else 0
+                            file_dma_ref.write(format(int(value) & mask,
+                                                      f"0{params.DMA_BITWIDTH}b") + "\n")
         else:
             file_dma_ref = [0 for layer_repetition in range(layer_params.needed_total_transmissions)]
             for layer_repetition in range(layer_params.needed_total_transmissions):
@@ -423,9 +423,6 @@ def write_iact_file(layer_params, layer_number, dram):
             iact_ref[c].close()
 
 def write_psum_file(layer_params, layer_number, dram, calculated_results):
-    manager = mp.Manager()
-    return_dict = manager.dict()
-    jobs = []
     if "Dense" in str(layer_params.layer_name):
         psum_ref = gtu.open_or_create_file('demo/layer_' + str(layer_number) + '/psum/psum_ref' + '_0.csv')
         for x in range(layer_params.filters):
@@ -443,6 +440,8 @@ def write_psum_file(layer_params, layer_number, dram, calculated_results):
                 psum_ref[c].write("\n")
             psum_ref[c].close()
     elif "Conv" in str(layer_params.layer_name):
+        manager = mp.Manager()
+        return_dict = manager.dict()
         run_jobs_bounded(
             lambda f: mp.Process(target = write_psum_file_conv_mp,
                                  args = (f, layer_params, calculated_results, return_dict)),
@@ -472,15 +471,13 @@ def write_psum_file_conv_mp(f, layer_params, calculated_results, return_dict):
 def collect_results(layer_number, layer_params, dram, serial):
     #Calculate Bias
     if "Dense" in str(layer_params.layer_name):
-        calculated_results = [0 for i in range(layer_params.filters)]
-        manager = mp.Manager()
-        return_dict = manager.dict()
-        jobs = []
-        run_jobs_bounded(
-            lambda x: mp.Process(target = calculate_dense_results_mp,
-                                 args = (x, layer_params, layer_number, dram, calculated_results[x], return_dict)),
-            layer_params.filters)
-        calculated_results = return_dict
+        # These dot products are small; spawning an interpreter per output
+        # costs far more than the arithmetic. Keep the same reference routine
+        # and output indexing, without multiprocessing startup or IPC.
+        calculated_results = {}
+        for x in range(layer_params.filters):
+            calculate_dense_results_mp(
+                x, layer_params, layer_number, dram, 0, calculated_results)
 
     elif "Depthwise" in str(layer_params.layer_name):
         calculated_results = [[[0 for i in range(layer_params.output_shape[2])] for j in range(layer_params.output_shape[1])]for k in range(layer_params.output_shape[3])]
@@ -540,8 +537,8 @@ def collect_results(layer_number, layer_params, dram, serial):
                         temp = 0
                         for x in range(layer_params.input_shape[1]):
                             for y in range(layer_params.input_shape[2]):
-                                temp = temp + dram.fmap[layer_number][x][y]
-                        temp = temp//(layer_params.inut_shape[1]*layer_params.input_shape[2])
+                                    temp = temp + dram.fmap[layer_number][f][x][y]
+                        temp = temp//(layer_params.input_shape[1]*layer_params.input_shape[2])
                         calculated_results[f][j][i] = int(temp)
 
     return calculated_results
@@ -556,7 +553,9 @@ def refresh_position(x_cor, y_cor, filter, y_line_counter, kernel_counter, layer
     return x_cor, y_cor, filter, y_line_counter, kernel_counter
 
 def calculate_conv_serial(params, layer_params, calculated_results, file_dma_ref):
-    words_per_transmission = params.DMA_BITWIDTH//params.DATA_PSUM_BITWIDTH
+    # FPGA readout transfers two psums per 64-bit beat (one per 32-bit
+    # beat), even when the accumulator itself is narrower than 32 bits.
+    words_per_transmission = params.DMA_BITWIDTH // 32
     filter_cycles = ((layer_params.filters//layer_params.used_psum_per_PE)//layer_params.different_kernels_per_calculation)
     output_number = layer_params.iact_size_y*layer_params.iact_size_x*layer_params.filters
     needed_refreshes = math.ceil(output_number / (layer_params.iact_size_x * layer_params.different_kernels_per_calculation * layer_params.y_lines_per_calculation) / layer_params.used_psum_per_PE)
@@ -574,7 +573,7 @@ def calculate_conv_serial(params, layer_params, calculated_results, file_dma_ref
             kernel_counter = 0
             x_cor = les.x_start
             y_cor = les.y_start
-            for cl_y in range(params.Clusters_Y//layer_params.used_Y_cluster) :
+            for cl_y in range(params.Clusters_Y) :
                 for cl_x in range(params.Clusters_X) :
                     if (x_cor >= layer_params.psum_size_x+layer_params.add_up) :
                         if (kernel_counter < layer_params.different_kernels_per_calculation - 1) :
@@ -585,17 +584,20 @@ def calculate_conv_serial(params, layer_params, calculated_results, file_dma_ref
                         temp_string = ""
                         for _ in range(words_per_transmission) :
                                 array.append((x_cor,y_cor,filter))
-                                if (kernel_counter < layer_params.different_kernels_per_calculation) :
-                                    if((x_cor < layer_params.psum_size_x) & (y_cor < layer_params.psum_size_y)) :
-                                        try:
-                                            temp_string =gtu.to_twos_complement_string(calculated_results[filter][x_cor][y_cor],params.DATA_PSUM_BITWIDTH) +  temp_string
-                                        except:
+                                if (cl_y%layer_params.used_Y_cluster == 0):
+                                    if (kernel_counter < layer_params.different_kernels_per_calculation) :
+                                        if((x_cor < layer_params.psum_size_x) & (y_cor < layer_params.psum_size_y)) :
+                                            try:
+                                                temp_string =gtu.to_twos_complement_string(calculated_results[filter][x_cor][y_cor],params.DATA_PSUM_BITWIDTH) +  temp_string
+                                            except:
+                                                temp_string = gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH) + temp_string
+                                        else:
                                             temp_string = gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH) + temp_string
-                                    else:
-                                        temp_string = gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH) + temp_string
 
-                                    x_cor = x_cor + 1
-                        file_dma_ref.write(temp_string+ "\n")
+                                        x_cor = x_cor + 1
+                                else:
+                                    temp_string =gtu.to_twos_complement_string(0,params.DATA_PSUM_BITWIDTH) +  temp_string
+                        file_dma_ref.write(temp_string.zfill(params.DMA_BITWIDTH) + "\n")
             filter = filter + 1
         if ((filter >= layer_params.filters)) :
             if (x_cor >= layer_params.psum_size_x+layer_params.psum_add_up) :
@@ -835,14 +837,15 @@ def compare_dram_with_ref_mp(f, ref_output, dram, return_dict):
         - Provides detailed error logging of mismatches
     """
     return_dict[f] = True
+    logged = 0
     for x in range(len(ref_output)):
         for y in range(len(ref_output[x])):
             if dram[x][y] != ref_output[x][y]:
-                logger.error(f'Difference found at f = {f}, x = {x}, y= {y}')
-                logger.error(f'ReferenceData: {str(ref_output[x][y])}')
-                logger.error(f'Output Stream: {str(dram[x][y])}')
+                if logged < 64:
+                    logger.error(f'Difference found at f = {f}, x = {x}, y= {y}: '
+                                 f'reference {ref_output[x][y]}, DUT {dram[x][y]}')
+                logged += 1
                 return_dict[f] = False
-                return
           
 def fill_dram_with_ref(ref_output, dram, current_layer_params, next_layer_params):
     """Fill DRAM with reference output data for testing.
@@ -890,10 +893,18 @@ def fill_dram_with_ref(ref_output, dram, current_layer_params, next_layer_params
                             pos = pos + (current_layer_params.iact_size_x*current_layer_params.iact_size_y*4*math.floor(f/4))
                             dram[pos] = ref_output[f][x][y]
     elif "Pooling" in str(current_layer_params.layer_name):
-        for f in range(len(ref_output)):    
-            for x in range(len(ref_output[f])):
-                for y in range(len(ref_output[f][x])):
-                    dram[f][x][y] = ref_output[f][x][y]
+        if "Dense" in str(next_layer_params.layer_name):
+            for f in range(len(ref_output)):
+                for x in range(len(ref_output[f])):
+                    for y in range(len(ref_output[f][x])):
+                        pos = (f%4)+((f//4)*(4*len(ref_output[0])*len(ref_output[0][0])))
+                        pos = pos+((x%2)*4)+((x//2)*4*2)+y*len(ref_output[0]*4)
+                        dram[pos] = ref_output[f][x][y]
+        else:
+            for f in range(len(ref_output)):    
+                for x in range(len(ref_output[f])):
+                    for y in range(len(ref_output[f][x])):
+                        dram[f][x][y] = ref_output[f][x][y]
     elif "Dense" in str(current_layer_params.layer_name):
         for f in range(len(ref_output)):  
             dram[f] = ref_output[f]

@@ -256,6 +256,9 @@ module OpenEye_FPGA #(
 
     localparam integer TEMP_BITS_PSUM_TO_IACT = IACT_RAM_CELLS_VALUES_PER_WORD * DATA_IACT_BITWIDTH * TEMP_WORDS_PSUM_TO_IACT,
 
+    // One write-back group reads one cluster. Extra quantizer instances do
+    // not add spatial lanes to that cluster or channels to the transpose.
+    localparam integer WRITEBACK_WORDS = TRANS_WORDS < NUM_GLB_PSUM ? TRANS_WORDS : NUM_GLB_PSUM,
     localparam integer PSUM_OUTPUT_WORDS = DMA_BITWIDTH == 64? 2 : 1
 ) (
     //Clock and Reset
@@ -387,8 +390,8 @@ reg [1023:0] fst_path;
   wire [15:0]                       iact_glb_writing_cycles;
   reg [$clog2(CLUSTER_COLUMNS)-1:0] fsm_x_cl;          // Current cluster column being processed during weight loading.
   reg [$clog2(CLUSTER_ROWS)-1:0] fsm_y_cl;             // Current cluster row being processed during weight loading.
-  reg [$clog2(NUM_GLB_IACT)-1:0] fsm_iact_r;           // Current iact GLB index during iact loading (unused after refactor but kept for compatibility).
-  reg [$clog2(NUM_GLB_WGHT)-1:0] fsm_wght_r;           // Current weight GLB index; increments each DMA word in GET_WGHT, wraps at NUM_GLB_WGHT.
+  reg [((NUM_GLB_IACT > 1) ? $clog2(NUM_GLB_IACT) : 1)-1:0] fsm_iact_r; // Current iact GLB index during iact loading.
+  reg [((NUM_GLB_WGHT > 1) ? $clog2(NUM_GLB_WGHT) : 1)-1:0] fsm_wght_r; // Current weight GLB index during GET_WGHT.
   reg [$clog2(NUM_GLB_PSUM)-1:0] fsm_psum_r;           // Current psum GLB index during psum output; used by PSUM FSM.
   reg [$clog2(NUM_GLB_PSUM)-1:0] fsm_psum_r_q;         // One-cycle delayed fsm_psum_r; compensates for the pipelined RAM read in PSUM_SEND_RESULTS.
   reg results_ready;                                   // Local flag (combinatorial inside always block): AND of all active psum_enable_o or psum_ready_o signals.
@@ -549,6 +552,14 @@ reg [1023:0] fst_path;
   reg iact_converter_en_enc_reg[CLUSTER_COLUMNS-1:0][CLUSTER_ROWS-1:0];        // Pulse: run one encode step (outputs one word to the iact GLB interface).
   wire [7:0] x_lines_reg;                                                       // Number of x-lines per iact pass (from dma_storage); forwarded to iact_stream_constructor.
   reg send_data_reg;                                                             // One-cycle pulse that triggers the data-flow process to begin streaming to OpenEye_Parallel.
+  // Shared FC activation banks deliver PE rows one after another. Hold the
+  // compute pulse until the last row has written its input SPad.
+  reg [15:0] fc_readout_elapsed;
+  reg fc_compute_pending;
+  // Each row takes `channels` data clocks plus four FSM/RAM turnaround
+  // clocks; the final four clocks cover launch and the PE SPad write stage.
+  wire [15:0] fc_readout_required =
+      (iact_channels_per_pe + 16'd4) * NUM_GLB_WGHT + 16'd4;
   wire store_in_psum;                                                            // When 1: keep psums in psum_buffer for further accumulation instead of sending them out (from dma_storage).
   wire iact_converter_ready_w[CLUSTER_COLUMNS-1:0][CLUSTER_ROWS-1:0];          // Per-converter ready signal; high when the converter has finished its current batch.
 
@@ -564,7 +575,7 @@ reg [1023:0] fst_path;
   reg [3:0] iact_converter_mem_off_3_reg[CLUSTER_COLUMNS-1:0][CLUSTER_ROWS-1:0];
   reg [10-1:0] iact_to_psum_x_pos_counter;
   reg [4-1:0] iact_to_psum_trans_counter;
-  reg [$clog2(IACT_RAM_CELLS*(8/TRANS_WORDS))-1:0] iact_to_psum_storage_counter;
+  reg [$clog2(IACT_RAM_CELLS*(8/WRITEBACK_WORDS))-1:0] iact_to_psum_storage_counter;
   reg [2*64*IACT_RAM_CELLS-1:0] iact_to_psum_shift_reg;
   reg [2*64*IACT_RAM_CELLS-1:0] iact_to_psum_mux_reg;
   reg iact_to_psum_start_shifting;
@@ -579,6 +590,7 @@ reg [1023:0] fst_path;
   // -----------------------------------------------------------------------
   wire [7:0] iact_converter_max_cycles;             // Total y-lines to process including kernel overlap = iact_size_y + kernel_size - 1 (set in GET_WGHT).
   wire [11:0] iact_buffer_words_per_write;          // Words written per cycle into iact buffer per writing cycle
+  wire [11:0] iact_x_pos_inc;
   wire [7:0] iact_words_per_compute;
   wire [7:0] iact_converter_buffer_addr_max_cycles; // Maximum value of iact_converter_buffer_addr_cycles (from dma_storage).
   reg [7:0] iact_converter_cycles;                  // Current y-line counter [0..iact_converter_max_cycles-1]; drives the sliding window advancement.
@@ -745,12 +757,12 @@ reg [1023:0] fst_path;
             single_iteration  <= 1;
             single_iteration3 <= 1;
             if (iact_channels_counter == iact_channel_max_cycles -1) begin
-              if (iact_router_counter == needed_y_cls_reg - 1) begin
-                iact_cycle_count <= iact_cycle_count + 1;
-                if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
-                  iact_cycle_count <= 0;
-                end
+              //if (iact_router_counter == needed_y_cls_reg - 1) begin
+              iact_cycle_count <= iact_cycle_count + 1;
+              if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
+                iact_cycle_count <= 0;
               end
+              //end
             end
           end
         end else begin
@@ -769,12 +781,7 @@ reg [1023:0] fst_path;
         end
       end
       if ((RECEIVE_PSUMS_TO_IACT == fsm_current_state) | (fsm_current_state == WAIT_FOR_RESULTS)) begin
-        if (single_iteration) begin
-          single_iteration2 <= 1;
-        end
-        if (single_iteration == 0) begin
-          single_iteration2 <= 0;
-        end
+        single_iteration2 <= single_iteration;
       end
       if ((fsm_current_state == GET_PARAMETERS) |
         reset_cycle) begin
@@ -833,7 +840,8 @@ reg [1023:0] fst_path;
   reg [7:0] iact_converter_c;      // Input channel index currently being configured.
   // additional register for fsm
   reg [$clog2(CLUSTER_ROWS+1)-1:0] fsm_row;        // Current CLUSTER_ROW target; steps by needed_y_cls_reg.
-  reg [$clog2(CLUSTER_ROWS+1)-1:0] fsm_row_offset; // Interleave offset; cycles 0..needed_y_cls_reg-1.
+  reg [$clog2(CLUSTER_ROWS+1)-1:0] fsm_row_temp;   // Temporary next CLUSTER_ROW target.
+  reg [$clog2(CLUSTER_ROWS*NUM_GLB_WGHT+1)-1:0] fsm_row_offset; // Interleave offset; cycles 0..needed_y_cls_reg-1.
   integer a, b, word, line;
   always @(posedge clk_i, negedge rst_n) begin
   if (!rst_n) begin
@@ -845,6 +853,7 @@ reg [1023:0] fst_path;
     iact_converter_y              <= 0;
     iact_converter_c              <= 0;
     fsm_row                       <= 0;
+    fsm_row_temp                  <= 0;
     fsm_row_offset                <= 0;
     for (a = 0; a < CLUSTER_COLUMNS; a=a+1) begin
       for (b = 0; b < CLUSTER_ROWS; b=b+1) begin
@@ -920,11 +929,13 @@ reg [1023:0] fst_path;
         end
         fsm_row <= fsm_row + needed_y_cls_reg;
         if (fsm_row + needed_y_cls_reg >= CLUSTER_ROWS) begin
-          fsm_row        <= fsm_row_offset + 1;
-          fsm_row_offset <= fsm_row_offset + NUM_GLB_IACT;
-          if (fsm_row_offset == NUM_GLB_IACT * (needed_y_cls_reg - 1)) begin
+          fsm_row        <= fsm_row_temp + 1;
+          fsm_row_temp   <= fsm_row_temp + 1;
+          fsm_row_offset <= fsm_row_offset + NUM_GLB_WGHT;
+          if (fsm_row_offset == NUM_GLB_WGHT * (needed_y_cls_reg - 1)) begin
             fsm_row        <= 0;
             fsm_row_offset <= 0;
+            fsm_row_temp   <= 0;
           end
         end
         iact_converter_x <= iact_converter_x + (CLUSTER_COLUMNS * iact_x_per_cluster);
@@ -1040,7 +1051,16 @@ end
       if (fsm_last_state == GET_PARAMETERS) begin
         conv_array_reg <= start_param_array;
         if (fully_connected_layer) begin
-          conv_array_reg <= 3;
+          // Enable every cluster at once. The value 3 sets only the bits of
+          // cluster row 0 (the bit index is col + row*CLUSTER_COLUMNS) and
+          // relied on the rotate-left-by-2 below to hand the remaining rows
+          // their turn on later encode steps. There is no later step:
+          // iact_converter_enc_enable is asserted once in START_CONVERTER and
+          // cleared on the first CONVERT_IACT cycle, so the rotation never
+          // takes effect. Every row above 0 was therefore never told to
+          // commit and its clusters received nothing but zero payload, which
+          // left a 32-wide Dense layer accumulating 9 of 32 products.
+          conv_array_reg <= {CLUSTERS{1'b1}};
         end
       end
       for (a = 0; a < CLUSTER_COLUMNS; a=a+1) begin
@@ -1119,6 +1139,8 @@ end
       wght_buffer_rd_addr         <= 0;
       wght_buffer_rd_addr_storage <= 0;
       compute_reg                 <= 0;
+      fc_readout_elapsed          <= 0;
+      fc_compute_pending          <= 0;
       wght_sendable               <= 0;
       flat_help_var_send           = 0;
       for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
@@ -1137,9 +1159,19 @@ end
         end
       end
       compute_reg <= 0;
+      if (send_data_reg && !sending_data)
+        fc_readout_elapsed <= 0;
+      else if (sending_data && fc_readout_elapsed < fc_readout_required)
+        fc_readout_elapsed <= fc_readout_elapsed + 1;
+      if (fc_compute_pending && fc_readout_elapsed >= fc_readout_required) begin
+        compute_reg <= 1;
+        fc_compute_pending <= 0;
+      end
       if (send_data_reg | sending_data) begin
         sending_data <= 1;
-        fsm_sending_cycle <= fsm_sending_cycle + PARALLEL_MACS;
+        // wghts_per_pe and the RAM address count packed words. One word
+        // leaves the buffer each clock, regardless of its MAC lane count.
+        fsm_sending_cycle <= fsm_sending_cycle + 1;
         if (!sending_data) begin
           for (a = 0; a < CLUSTER_COLUMNS; a=a+1) begin
             for (b = 0; b < CLUSTER_ROWS; b=b+1) begin
@@ -1177,7 +1209,11 @@ end
             wght_buffer_en_r  <= 0;
             wght_enable_i_reg <= 0;
             if (current_cycle == 0) begin
-              compute_reg <= 1;
+              if (fully_connected_layer && (NUM_GLB_IACT < NUM_GLB_WGHT) &&
+                  (fc_readout_elapsed < fc_readout_required))
+                fc_compute_pending <= 1;
+              else
+                compute_reg <= 1;
             end
           end
         end
@@ -1194,16 +1230,15 @@ end
                 wght_sendable <= 0;
               end
               if (iact_channels_counter == iact_channel_max_cycles -1) begin
-                if (iact_channel_max_cycles != 1) begin
-                  wght_buffer_rd_addr <= wght_buffer_rd_addr_storage;
-                end
-                if (iact_router_counter == needed_y_cls_reg - 1) begin
+                //if (iact_channel_max_cycles != 1) begin
+                //  wght_buffer_rd_addr <= wght_buffer_rd_addr_storage;
+                //end
+                if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
                   wght_buffer_rd_addr <= wght_buffer_rd_addr;
                   wght_buffer_rd_addr_storage <= wght_buffer_rd_addr;
-                  if (iact_cycle_count == {{8 {1'd0}},needed_wght_cycles} - 1) begin
-                    wght_buffer_rd_addr_storage <= 0;
-                    wght_buffer_rd_addr         <= 0;
-                  end
+                  //if (iact_router_counter == needed_y_cls_reg - 1) begin #Fix later, will be used at a later stage of kernel_size > PE_Y
+                  wght_buffer_rd_addr         <= 0;
+                  wght_buffer_rd_addr_storage <= 0;
                 end
               end
             end
@@ -1225,6 +1260,8 @@ end
         wght_buffer_en_r    <= 0;
         wght_buffer_rd_addr <= 0;
         compute_reg         <= 0;
+        fc_readout_elapsed  <= 0;
+        fc_compute_pending  <= 0;
         wght_sendable       <= 1;
         flat_help_var_send = 0;
         for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
@@ -1244,6 +1281,8 @@ end
         wght_buffer_rd_addr            <= 0;
         wght_buffer_rd_addr_storage    <= 0;
         compute_reg                    <= 0;
+        fc_readout_elapsed             <= 0;
+        fc_compute_pending             <= 0;
         wght_sendable                  <= 1;
         flat_help_var_send              = 0;
         for (a = 0; a < CLUSTER_COLUMNS; a=a+1) begin
@@ -1357,6 +1396,8 @@ end
   reg        [(8*DATA_IACT_BITWIDTH*NUM_GLB_IACT)-1:0] iact_input_window;
   reg        [(2*DATA_IACT_BITWIDTH*NUM_GLB_IACT)-1:0] iact_input_window_q;
   reg        [(2*DATA_IACT_BITWIDTH*NUM_GLB_IACT)-1:0] iact_input_window_q2;
+
+  reg fc_storage_valid_q, fc_storage_valid_q2;
 
   reg [ 7:0] iact_channel_counter_reg;  // Registered copy of iact_channels_counter for cross-process use.
 
@@ -1595,6 +1636,8 @@ end
       iact_input_window            <= 0;
       iact_input_window_q          <= 0;
       iact_input_window_q2         <= 0;
+      fc_storage_valid_q          <= 0;
+      fc_storage_valid_q2         <= 0;
       iact_channel_sending_cycle1  <= 0;
       iact_channel_sending_cycle2  <= 0;
     end else begin
@@ -1602,6 +1645,8 @@ end
         pooling_buffer_old_q[a] <= pooling_buffer_old[a];
       end
       iact_input_window_q2 <= iact_input_window_q;
+      fc_storage_valid_q <= 0;
+      fc_storage_valid_q2 <= fc_storage_valid_q;
       case (fsm_current_state)
 
         // -------------------------------------------------------------------
@@ -1661,17 +1706,26 @@ end
           end
           buffer_addr_temp_reg    <= 0;
           iact_buffer_data_w <= 0;
-          for (a = 0; a < 32; a = a + 1) begin
-            pooling_regs[a] <= -128;
-          end
-          for (a = 0; a < 8; a = a + 1) begin
-            pooling_stage_1[a] <= -128;
-          end
-          for (a = 0; a < 4; a = a + 1) begin
-            pooling_stage_2[a] <= -128;
-          end
-          for (a = 0; a < 2; a = a + 1) begin
-            pooling_stage_3[a] <= -128;
+          if (AVERAGE_POOLING == 1) begin
+            for (a = 0; a < 8; a = a + 1) begin
+              pooling_stage_1[a] <= 0;
+            end
+            for (a = 0; a < 4; a = a + 1) begin
+              pooling_stage_2[a] <= 0;
+            end
+          end else begin
+            for (a = 0; a < 32; a = a + 1) begin
+              pooling_regs[a] <= -128;
+            end
+            for (a = 0; a < 8; a = a + 1) begin
+              pooling_stage_1[a] <= -128;
+            end
+            for (a = 0; a < 4; a = a + 1) begin
+              pooling_stage_2[a] <= -128;
+            end
+            for (a = 0; a < 2; a = a + 1) begin
+              pooling_stage_3[a] <= -128;
+            end
           end
           pooling_stage_4 <= -128;
           quant_reg       <= 0;
@@ -1989,6 +2043,14 @@ end
               select_ram_counter2 <= 0;
               buffer_addr_temp_reg <= -1;
               iact_buffer_data_w   <= 0;
+              // pooling_buffer_enable above pulses every layer's GET_QUANTIZE
+              // (not just pooling ones), which drives the running-max ring
+              // buffer's ready_i and drifts its read/write pointers before
+              // this layer's own pooling pass ever starts. The single
+              // set_pointer_start reset in MAXPOOLING_SEND only fires when
+              // leaving a pooling layer, so it does not protect against that
+              // drift. Reset again right here, before the first real push.
+              set_pointer_start    <= 1;
             end
           end
         end
@@ -2071,8 +2133,10 @@ end
               iact_channel_sending_cycle2 <= iact_channel_sending_cycle2 + 1;
               if (iact_channel_sending_cycle2 == channel_div_trans - 1) begin
                 iact_channel_sending_cycle2 <= 0;
-                current_x <= current_x + NUM_GLB_IACT;
-                if (current_x == x_bound) begin 
+                // The input sweep is serial: one channel pair of one pixel.
+                // Parallel activation ports are populated by the constructor.
+                current_x <= current_x + (fully_connected_layer ? 2 : 1);
+                if (!fully_connected_layer & (current_x == x_bound)) begin
                   current_x <= -padding_x;
                   current_y <= current_y + 1;
                   if (current_y == y_bound) begin
@@ -2081,11 +2145,27 @@ end
                 end
               end 
               iact_input_window_q <= 0;
-              if ((current_x >= 0) & (current_y >= 0) & (current_x < iact_size_x) & (current_y < iact_size_y)) begin
+              // Include zero padding so every FC bank receives a complete tile.
+              fc_storage_valid_q <= fully_connected_layer & (current_x < iact_size_c);
+              // iact_size_x arrives halved for FC layers (dense_mapper sends
+              // ceil(iact_size_x/2), a word count) while current_x counts
+              // activations, so the sweep stopped at half the input. fc_size_reg
+              // carries the full FC input size.
+              if ((current_x >= 0) & (current_y >= 0) &
+                  (current_x < (fully_connected_layer ? fc_size_reg : iact_size_x)) &
+                  (current_y < iact_size_y)) begin
                 iact_input_window       <= iact_input_window >> 16;
                 iact_input_window_q     <= iact_input_window[15:0];
+                if (!fully_connected_layer && (iact_channels_per_pe == 1)) begin
+                  iact_input_window <= iact_input_window >> DATA_IACT_BITWIDTH;
+                  iact_input_window_q <= iact_input_window[DATA_IACT_BITWIDTH-1:0];
+                end
+                if (fully_connected_layer & (current_x + 1 >= fc_size_reg))
+                  iact_input_window_q[15:8] <= 0;
                 relative_pos            <= relative_pos + 1;
-                if (relative_pos == IACT_RAM_CELLS - 1) begin
+                if (relative_pos == ((!fully_connected_layer && (iact_channels_per_pe == 1)) ?
+                    (IACT_RAM_CELLS_WORD_BITWIDTH / DATA_IACT_BITWIDTH - 1) :
+                    (IACT_RAM_CELLS_WORD_BITWIDTH / (2 * DATA_IACT_BITWIDTH) - 1))) begin
                   relative_pos             <= 0;
                   current_pos_in_iact_glb  <= current_pos_in_iact_glb + 1;
                   if (current_pos_in_iact_glb == IACT_RAM_CELLS - 1) begin
@@ -2102,7 +2182,6 @@ end
               end
             end
           end
-          //if (fsm_cycle == iact_buffer_words_per_write) begin
           if (fsm_cycle == iact_glb_writing_cycles) begin
             fsm_current_state     <= WAIT_CYCLE;
             fsm_cycle             <= 0;
@@ -2177,18 +2256,15 @@ end
         //   increments and wraps at iact_channel_max_cycles.
         // - Each cycle: clears buffer write enables; if any were set in the
         //   previous cycle, advances that cell's read address by 1.
-        // - When PSUM FSM is in SEND_PSUM_TO_IACT and fsm_psum_cycle >= 3
-        //   (quantized_value_reg is valid)
-        //   Packs quantized bytes into iact_buffer_data_w cells using one
-        //   of three sub-modes determined by iact_channels_per_pe_next_layer:
-        //     4: 4 bytes per pixel (normal conv next layer); uses select_ram_counter,
-        //        wrapping-window logic, and overhang_discrepancy for odd iact_size_x.
-        //     2: 2 bytes per pixel; simpler counter walking 16 cells.
-        //     1: 1 byte per pixel (single-channel or FC); packs into 8-byte words
-        //        using overhang_discrepancy to track sub-word offset.
-        // - Exit: when PSUM FSM returns to PSUM_IDLE (all results written):
-        //   Resets select_ram_counter, fsm_cycle; enables all buffer writes
-        //   for one cycle (to flush); transitions to GET_PARAMETERS.
+        // - At SEND_PSUM_TO_IACT cycle 7, the RAM read, pre-quantization
+        //   register, and three quantizer stages have produced valid bytes.
+        // - Transposes a WRITEBACK_WORDS-wide group from filter-major psums
+        //   into pixel-major activation bytes. Only the spatial lanes in
+        //   one cluster participate; unused quantizer instances are ignored.
+        // - Shifts groups into the activation RAM write bus and writes a
+        //   complete bank row when the storage counter wraps.
+        // - After PSUM_IDLE, flushes the remaining groups before returning
+        //   to GET_PARAMETERS for the next layer.
         // -------------------------------------------------------------------
         RECEIVE_PSUMS_TO_IACT: begin
           if (fsm_psum_current_state == WAIT_FOR_SENDING_RESULTS) begin
@@ -2215,7 +2291,7 @@ end
               iact_to_psum_x_pos_counter <= iact_to_psum_x_pos_counter + 1;
               if (iact_to_psum_x_pos_counter < iact_size_x) begin
                 iact_to_psum_storage_counter <= iact_to_psum_storage_counter + 1;
-                if (iact_to_psum_storage_counter == ((8/TRANS_WORDS)*IACT_RAM_CELLS)-1) begin
+                if (iact_to_psum_storage_counter == ((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1) begin
                   iact_to_psum_storage_counter <= 0;
                   for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
                     iact_buffer_en_w[a] <= 1;
@@ -2223,48 +2299,53 @@ end
                 end
 
                 
-                iact_buffer_data_w[(((8/TRANS_WORDS)*IACT_RAM_CELLS)-1)*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)] <= iact_to_psum_shift_reg[0+:(DATA_IACT_BITWIDTH*TRANS_WORDS)];
-                iact_to_psum_shift_reg[(TRANS_WORDS-1)*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)] <= 0;
-                for (b = 0; b < TRANS_WORDS-1; b=b+1) begin
-                  iact_to_psum_shift_reg[b*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)] <=
-                  iact_to_psum_shift_reg[(b+1)*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)];
+                iact_buffer_data_w[(((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1)*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)] <= iact_to_psum_shift_reg[0+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)];
+                iact_to_psum_shift_reg[(WRITEBACK_WORDS-1)*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)] <= 0;
+                for (b = 0; b < WRITEBACK_WORDS-1; b=b+1) begin
+                  iact_to_psum_shift_reg[b*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)] <=
+                  iact_to_psum_shift_reg[(b+1)*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)];
                 end
-                for (b = 0; b < ((8/TRANS_WORDS)*IACT_RAM_CELLS)-1; b=b+1) begin
-                  iact_buffer_data_w[(((8/TRANS_WORDS)*IACT_RAM_CELLS)-1-(b+1))*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)] <=
-                  iact_buffer_data_w[(((8/TRANS_WORDS)*IACT_RAM_CELLS)-1-b)*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)];
+                for (b = 0; b < ((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1; b=b+1) begin
+                  iact_buffer_data_w[(((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1-(b+1))*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)] <=
+                  iact_buffer_data_w[(((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1-b)*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)];
                 end
               end
             end
 
-            if (iact_to_psum_trans_counter == TRANS_WORDS) begin
+            if (iact_to_psum_trans_counter == WRITEBACK_WORDS) begin
               iact_to_psum_trans_counter  <= 1;
               iact_to_psum_shift_reg      <= iact_to_psum_mux_reg;
               iact_to_psum_start_shifting <= 1;
-              if (iact_to_psum_x_pos_counter >= iact_size_x - 1) begin
+              // A row is read as iact_x_add_up pixels (whole lanes of every used
+              // cluster); only the first iact_size_x are activations. Wrap the
+              // counter at the row period so the padding pixels are dropped by
+              // the (x_pos < iact_size_x) test above instead of being written as
+              // an extra word row.
+              if (iact_to_psum_x_pos_counter >= iact_x_add_up - 1) begin
                 iact_to_psum_x_pos_counter <= 0;
               end
             end            
-            for (a = 0; a < TRANS_WORDS; a=a+1) begin
-              iact_to_psum_mux_reg[a*(DATA_IACT_BITWIDTH*TRANS_WORDS)+(DATA_IACT_BITWIDTH*(TRANS_WORDS-1))+:DATA_IACT_BITWIDTH] <= quantized_value_reg[a];
+            for (a = 0; a < WRITEBACK_WORDS; a=a+1) begin
+              iact_to_psum_mux_reg[a*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+(DATA_IACT_BITWIDTH*(WRITEBACK_WORDS-1))+:DATA_IACT_BITWIDTH] <= quantized_value_reg[a];
             end
-            for (a = 0; a < TRANS_WORDS; a=a+1) begin
-              for (b = 0; b < TRANS_WORDS-1; b=b+1) begin
-                iact_to_psum_mux_reg[a*(DATA_IACT_BITWIDTH*TRANS_WORDS)+(DATA_IACT_BITWIDTH*(TRANS_WORDS-1)-((b+1)*DATA_IACT_BITWIDTH))+:DATA_IACT_BITWIDTH] <=
-                iact_to_psum_mux_reg[a*(DATA_IACT_BITWIDTH*TRANS_WORDS)+(DATA_IACT_BITWIDTH*(TRANS_WORDS-1)-(b*DATA_IACT_BITWIDTH))+:DATA_IACT_BITWIDTH];
+            for (a = 0; a < WRITEBACK_WORDS; a=a+1) begin
+              for (b = 0; b < WRITEBACK_WORDS-1; b=b+1) begin
+                iact_to_psum_mux_reg[a*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+(DATA_IACT_BITWIDTH*(WRITEBACK_WORDS-1)-((b+1)*DATA_IACT_BITWIDTH))+:DATA_IACT_BITWIDTH] <=
+                iact_to_psum_mux_reg[a*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+(DATA_IACT_BITWIDTH*(WRITEBACK_WORDS-1)-(b*DATA_IACT_BITWIDTH))+:DATA_IACT_BITWIDTH];
               end
             end
           end
           if ((fsm_psum_current_state == PSUM_IDLE) & (fsm_cycle >= 1)) begin
             iact_to_psum_storage_counter <= iact_to_psum_storage_counter + 1;
-            if (iact_to_psum_storage_counter == ((8/TRANS_WORDS)*IACT_RAM_CELLS)-1) begin
+            if (iact_to_psum_storage_counter == ((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1) begin
               iact_to_psum_storage_counter <= 0;
               for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
                 iact_buffer_en_w[a] <= 1;
               end
             end
-            for (b = 0; b < ((8/TRANS_WORDS)*IACT_RAM_CELLS)-1; b=b+1) begin
-              iact_buffer_data_w[(((8/TRANS_WORDS)*IACT_RAM_CELLS)-1-(b+1))*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)] <=
-              iact_buffer_data_w[(((8/TRANS_WORDS)*IACT_RAM_CELLS)-1-b)*(DATA_IACT_BITWIDTH*TRANS_WORDS)+:(DATA_IACT_BITWIDTH*TRANS_WORDS)];
+            for (b = 0; b < ((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1; b=b+1) begin
+              iact_buffer_data_w[(((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1-(b+1))*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)] <=
+              iact_buffer_data_w[(((8/WRITEBACK_WORDS)*IACT_RAM_CELLS)-1-b)*(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)+:(DATA_IACT_BITWIDTH*WRITEBACK_WORDS)];
             end
             if (iact_to_psum_storage_counter == 0) begin            
               select_ram_counter          <= 0;
@@ -2341,13 +2422,24 @@ end
         MAXPOOLING_READ: begin
           //Counting and setting inputs for reading values
 
+          // One-cycle pulse from GET_QUANTIZE above; clear it once seen.
+          set_pointer_start <= 0;
+
           //Ending Condition
-          if (iact_converter_cycles == (psum_size_x * 2)) begin
+          if ((iact_converter_cycles == (psum_size_x * 2) & (AVERAGE_POOLING == 0)) |
+              ((iact_converter_cycles == (8 - 1) & (AVERAGE_POOLING == 1)))) begin
             fsm_cycle               <= 0;
             iact_converter_cycles   <= 0;
             fsm_last_state          <= MAXPOOLING_READ;
             fsm_current_state       <= MAXPOOLING_SEND;
             buffer_addr_temp_reg    <= iact_buffer_addr_reg[0];
+            
+            if (AVERAGE_POOLING == 1) begin
+
+              for (a = 0; a < 4; a = a + 1) begin
+                pooling_stage_2[a] <= pooling_stage_2[a] >>> 4;
+              end
+            end
             for (a = 0; a < IACT_RAM_CELLS; a=a+1) begin
               iact_buffer_addr_reg[a] <= buffer_addr_temp_reg;
             end
@@ -2391,10 +2483,7 @@ end
             end else begin
               if (AVERAGE_POOLING == 1) begin
                 for (a = 0; a < 4; a = a + 1) begin
-                  pooling_stage_2[a] <= pooling_stage_1[2*a] + pooling_stage_1[2*a+1];
-                end
-                for (a = 0; a < 2; a = a + 1) begin
-                  pooling_stage_3[a] <= pooling_stage_2[2*a] >= pooling_stage_2[2*a+1];
+                  pooling_stage_2[a] <= pooling_stage_1[2*a] + pooling_stage_1[2*a+1] + pooling_stage_2[a];
                 end
                 for (a = 0; a < 32; a = a + 1) begin
                   for (b = 0; b < 2; b = b + 1) begin
@@ -2436,11 +2525,23 @@ end
           for (a = 0; a < IACT_RAM_CELLS; a = a + 1) begin
             iact_buffer_en_w[a] <= 0;
           end
-          for (a = 0; a < 4; a = a + 1) begin
-            iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <= pooling_buffer_old_q[a];
+          if (MAX_POOLING == 1) begin
+            // Only the first psum_size_x pushes of a pass are pooled pixels. The
+            // final pass keeps pushing until a whole RAM row is complete, and
+            // those pad pixels must be 0 (the layout the next layer expects),
+            // not the -128 the running-max buffer starts from.
+            for (a = 0; a < 4; a = a + 1) begin
+              iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <=
+                  (fsm_cycle < psum_size_x) ? pooling_buffer_old_q[a] : 8'd0;
+            end
+            iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
           end
-          iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
-          
+          if (AVERAGE_POOLING == 1) begin
+            for (a = 0; a < 4; a = a + 1) begin
+              iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+((DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM)/2)+(8*a)+:8] <= pooling_stage_2[a];
+            end
+            iact_buffer_data_w[((IACT_RAM_CELLS-1)*IACT_WORDS_IN_RAM*DATA_IACT_BITWIDTH)+(DATA_IACT_BITWIDTH*IACT_WORDS_IN_RAM/2)-1:0] <= iact_buffer_data_w >> 32;
+          end
           select_ram_counter2 <= select_ram_counter2 + 1;
           if (select_ram_counter2 == 8 - 1) begin
             select_ram_counter2 <= 0;
@@ -2449,7 +2550,13 @@ end
               iact_buffer_addr_reg[a] <= iact_buffer_addr_reg[a] + 1;
             end
           end
-          if (fsm_cycle >= psum_size_x - 1) begin
+          if ((fsm_cycle >= psum_size_x - 1) | 
+            AVERAGE_POOLING == 1) begin
+            if (AVERAGE_POOLING == 1) begin
+              for (a = 0; a < 4; a = a + 1) begin
+                pooling_stage_2[a] <= 0;
+              end
+            end
             if (finished_cycles_iact == needed_cycles-1) begin
               if (select_ram_counter2 == 8 - 1) begin
                 fsm_cycle             <= 0;
@@ -2481,6 +2588,9 @@ end
           end
           if (fsm_cycle == 2) begin
             fsm_cycle         <= 5;
+            if (AVERAGE_POOLING == 1) begin
+              fsm_cycle         <= 4;
+            end
             fsm_last_state    <= MAXPOOLING_WAIT;
             fsm_current_state <= MAXPOOLING_READ;
           end
@@ -2722,6 +2832,7 @@ end
             .wr_en_i(iact_buffer_en_w[j_gen]),
             .addr_i(iact_buffer_addr[j_gen]),
             .data_i(iact_buffer_data_w[j_gen*IACT_RAM_CELLS_WORD_BITWIDTH+:IACT_RAM_CELLS_WORD_BITWIDTH]),
+            .wr_mask_i(1'b0),
             .data_o(iact_buffer_data_r[j_gen*IACT_RAM_CELLS_WORD_BITWIDTH+:IACT_RAM_CELLS_WORD_BITWIDTH])
         );
     end
@@ -2760,6 +2871,7 @@ end
         iact_stream_constructor #(
             .CLUSTER_COLUMNS   (CLUSTER_COLUMNS),
             .CLUSTER_ROWS      (CLUSTER_ROWS),
+            .CLUSTER_ROW_ID    (j_gen),
             .SPARSITY_EN       (SPARSITY_EN),
             .NUM_GLB_IACT      (NUM_GLB_IACT),
             .PE_X              (NUM_GLB_PSUM),
@@ -2773,6 +2885,7 @@ end
             .clk_i                       (clk_i),
             .rst_ni                      (rst_n),
             .storage_i                   (iact_input_window_q2),
+            .fc_storage_valid_i          (fc_storage_valid_q2),
             .reset_cycle_i               (reset_cycle),
             .params                      (iact_converter_params_reg[i_gen][j_gen]),
             .enable_config               (iact_converter_en_cfg_reg[i_gen][j_gen]),
@@ -2785,9 +2898,7 @@ end
             .iact_choose_o               (iact_choose_w),
             .needed_y_cls_i              (needed_y_cls_reg),
             .needed_iact_channel_cycles_i(iact_channel_max_cycles),
-            .fc_size_i                   (fc_size_reg),
             .iact_x_add_up               (iact_x_add_up),
-            .iact_size_y_i               (iact_size_y),
             .iact_channels_per_pe_i      (iact_channels_per_pe),
             .channel_div_trans           (channel_div_trans),
             .x_lines_i                   (iact_x_line_repetitions),
@@ -2797,9 +2908,9 @@ end
             .wght_size_y_i               (kernel_size_y),
             .stride_x_i                  (stride_x),
             .stride_y_i                  (stride_y),
-            .iact_x_per_cluster_i        (iact_x_per_cluster),
             .y_lines_per_calc            (y_lines_per_calc),
             .fully_connected_i           (fully_connected_layer),
+            .x_pos_inc                   (iact_x_pos_inc),
             .needed_iact_buffer_words_i  (iact_buffer_words_per_write),
             .iact_words_per_compute      (iact_words_per_compute),
             .rd_loop_limit_0             (iact_read_limit_0),
@@ -2885,6 +2996,7 @@ end
               // strides too doubles them for NUM_GLB_PSUM>1 and runs off the
               // end of the bus.
               .data_i (psum_buffer_data_w[i_gen*TRANS_BITWIDTH_PSUM*NUM_GLB_PSUM+j_gen*TRANS_BITWIDTH_PSUM*CLUSTER_COLUMNS*NUM_GLB_PSUM+g_gen*PSUM_BUFFER_WIDTH+:PSUM_BUFFER_WIDTH]),
+              .wr_mask_i(1'b0),
               .data_o (psum_buffer_data_r[i_gen*TRANS_BITWIDTH_PSUM*NUM_GLB_PSUM+j_gen*TRANS_BITWIDTH_PSUM*CLUSTER_COLUMNS*NUM_GLB_PSUM+g_gen*PSUM_BUFFER_WIDTH+:PSUM_BUFFER_WIDTH])
           );
         end
@@ -2982,6 +3094,7 @@ end
         .fsm_psum_limit(fsm_psum_limit),
         .cluster_per_conv_cycle(cluster_per_conv_cycle),
         .iact_converter_max_cycles(iact_converter_max_cycles),
+        .iact_x_pos_inc(iact_x_pos_inc),
         .iact_buffer_words_per_write(iact_buffer_words_per_write),
         .iact_words_per_compute(iact_words_per_compute),
         .pooling_mode(pooling_mode),
@@ -3173,7 +3286,8 @@ end
         .bano_cluster_mode_i          (bano_cluster_mode_reg),
         .af_cluster_mode_i            (af_cluster_mode_reg),
         .pooling_cluster_mode_i       ({NUM_GLB_PSUM{1'd0}}),
-        .kernel_per_pe_cluster_i      (kernel_per_pe_cluster_reg[$clog2(NUM_GLB_WGHT)-1:0]),
+        .kernel_per_pe_cluster_i      (kernel_per_pe_cluster_reg[
+                                       ((NUM_GLB_WGHT > 1) ? $clog2(NUM_GLB_WGHT) : 1)-1:0]),
         .iact_x_line_repetitions_i    (iact_x_line_repetitions[3:0]),
         .kernel_size_y_i              (kernel_size_y),
         .input_activations_i          (input_activations),
@@ -3221,6 +3335,9 @@ end
                 iact_ready_o_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT + cr_gen * NUM_GLB_IACT + g_gen];*/
           assign IACT_CONVERTER_X[cc_gen].IACT_CONVERTER_Y[cr_gen].iact_ready_w[g_gen] =
                 (iact_ready_o_oep_w == (2**(CLUSTER_COLUMNS*CLUSTER_ROWS*NUM_GLB_IACT))-1);
+          // TODO DenLeb: per-cluster ready below breaks input height > 1 (test_conv_tall_input), please check
+          //assign IACT_CONVERTER_X[cc_gen].IACT_CONVERTER_Y[cr_gen].iact_ready_w[g_gen] =
+          //      iact_ready_o_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT + cr_gen * NUM_GLB_IACT + g_gen];
           assign iact_enable_i_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT + cr_gen * NUM_GLB_IACT + g_gen] =
                 IACT_CONVERTER_X[cc_gen].IACT_CONVERTER_Y[cr_gen].iact_enable_w[g_gen];
           assign iact_data_i_oep_w[cc_gen * CLUSTER_ROWS * NUM_GLB_IACT * TRANS_BITWIDTH_IACT +
