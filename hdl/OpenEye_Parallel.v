@@ -290,7 +290,7 @@ module OpenEye_Parallel #(
   reg                                                  raw_wght_i_reg;
   reg  [                                         19:0] needed_cycles_i_reg;
   reg  [                   $clog2(CLUSTER_ROWS+1)-1:0] needed_y_cls_i_reg;
-  reg  [                    $clog2(PSUM_PER_PE+1)-1:0] filters_i_reg;
+  reg  [                    $clog2(PSUM_PER_PE+1)-1:0] filters_reg;
   reg  [               $clog2(IACT_ADDR_PER_PE+1)-1:0] iact_channels_per_pe_i_reg;
   reg  [          $clog2(BANO_MODES)*NUM_GLB_PSUM-1:0] bano_cluster_mode_i_reg;
   reg  [            $clog2(AF_MODES)*NUM_GLB_PSUM-1:0] af_cluster_mode_i_reg;
@@ -383,7 +383,7 @@ module OpenEye_Parallel #(
           // handshake PE.v's stream_data logic expects) rather than removed,
           // to avoid changing the cycle count consumers rely on elsewhere.
           enable_stream_reg      <= 1;
-          data_stream_reg        <= {{(12 - $clog2(PSUM_PER_PE + 1)) {1'd0}}, filters_i_reg};
+          data_stream_reg        <= {{(12 - $clog2(PSUM_PER_PE + 1)) {1'd0}}, filters_reg};
           fsm_transmission_state <= IDLE_TRANSMI;
         end
         default: begin
@@ -413,7 +413,7 @@ module OpenEye_Parallel #(
       raw_wght_i_reg                 <= 0;
       needed_cycles_i_reg            <= 0;
       needed_y_cls_i_reg             <= 0;
-      filters_i_reg                  <= 0;
+      filters_reg                    <= 0;
       iact_channels_per_pe_i_reg     <= 0;
       bano_cluster_mode_i_reg        <= 0;
       af_cluster_mode_i_reg          <= 0;
@@ -435,7 +435,7 @@ module OpenEye_Parallel #(
       raw_wght_i_reg              <= raw_wght_i;
       needed_cycles_i_reg         <= {2'b00, needed_cycles_i};
       needed_y_cls_i_reg          <= needed_y_cls_i;
-      filters_i_reg               <= filters_i;
+      filters_reg                 <= filters_i;
       iact_channels_per_pe_i_reg  <= iact_channels_per_pe_i;
       bano_cluster_mode_i_reg     <= bano_cluster_mode_i;
       af_cluster_mode_i_reg       <= {NUM_GLB_PSUM{af_cluster_mode_i}};
@@ -935,26 +935,26 @@ module OpenEye_Parallel #(
                               g_gen * ROUTER_MODES_PSUM+: ROUTER_MODES_PSUM];
           end
           assign gen_x[cc_gen].gen_y[cr_gen].psum_choose_cluster_i_w[g_gen] = psum_choose_i[cc_gen * NUM_GLB_PSUM + cr_gen * CLUSTER_COLUMNS * NUM_GLB_PSUM + g_gen];
-          if (cr_gen != CLUSTER_ROWS - 1) begin : gen_router_iact_bottom_connect
+          if (cr_gen != CLUSTER_ROWS - 1) begin : gen_router_psum_bottom_connect
             assign gen_x[cc_gen].gen_y[cr_gen + 1].data_src_top_psum_cluster_w[g_gen*TRANS_BITWIDTH_PSUM+: TRANS_BITWIDTH_PSUM] =
           gen_x[cc_gen].gen_y[cr_gen].data_dst_bottom_psum_cluster_w[g_gen*TRANS_BITWIDTH_PSUM+: TRANS_BITWIDTH_PSUM];
             assign gen_x[cc_gen].gen_y[cr_gen + 1].enable_src_top_psum_cluster_w[g_gen] = gen_x[cc_gen].gen_y[cr_gen].enable_dst_bottom_psum_cluster_w[g_gen];
             assign gen_x[cc_gen].gen_y[cr_gen + 1].ready_dst_top_psum_cluster_w[g_gen]  = gen_x[cc_gen].gen_y[cr_gen].ready_src_bottom_psum_cluster_w[g_gen];
           end
 
-          if (cr_gen != 0) begin : gen_router_iact_top_connect
+          if (cr_gen != 0) begin : gen_router_psum_top_connect
             assign gen_x[cc_gen].gen_y[cr_gen - 1].data_src_bottom_psum_cluster_w[g_gen*TRANS_BITWIDTH_PSUM+: TRANS_BITWIDTH_PSUM] = 
             gen_x[cc_gen].gen_y[cr_gen].data_dst_top_psum_cluster_w[g_gen*TRANS_BITWIDTH_PSUM+: TRANS_BITWIDTH_PSUM];
             assign gen_x[cc_gen].gen_y[cr_gen - 1].ready_dst_bottom_psum_cluster_w[g_gen]  = gen_x[cc_gen].gen_y[cr_gen].ready_src_top_psum_cluster_w[g_gen];
             assign gen_x[cc_gen].gen_y[cr_gen - 1].enable_src_bottom_psum_cluster_w[g_gen] = gen_x[cc_gen].gen_y[cr_gen].enable_dst_top_psum_cluster_w[g_gen];
           end
 
-          if (cr_gen == 0) begin : gen_router_iact_top_edge
+          if (cr_gen == 0) begin : gen_router_psum_top_edge
             assign gen_x[cc_gen].gen_y[cr_gen].data_src_top_psum_cluster_w[g_gen*TRANS_BITWIDTH_PSUM+: TRANS_BITWIDTH_PSUM] = 0;
             assign gen_x[cc_gen].gen_y[cr_gen].enable_src_top_psum_cluster_w[g_gen] = 0;
             assign gen_x[cc_gen].gen_y[cr_gen].ready_dst_top_psum_cluster_w[g_gen]  = 0;
           end
-          if (cr_gen == CLUSTER_ROWS - 1) begin : gen_router_iact_bottom_edge
+          if (cr_gen == CLUSTER_ROWS - 1) begin : gen_router_psum_bottom_edge
             assign gen_x[cc_gen].gen_y[cr_gen].data_src_bottom_psum_cluster_w[g_gen*TRANS_BITWIDTH_PSUM+: TRANS_BITWIDTH_PSUM] = 0;
             assign gen_x[cc_gen].gen_y[cr_gen].ready_dst_bottom_psum_cluster_w[g_gen]  = 0;
             assign gen_x[cc_gen].gen_y[cr_gen].enable_src_bottom_psum_cluster_w[g_gen] = 0;
